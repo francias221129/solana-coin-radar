@@ -248,8 +248,7 @@ def scan():
             f"Chart: {pair.get('url', 'Unavailable')}\n"
             f"Security report: "
             f"https://rugcheck.xyz/tokens/{address}\n"
-            f"Axiom: https://axiom.trade/\n\n"
-            f"⚠️ Informational screening only. "
+f"Axiom: https://axiom.trade/t/{address}\n"            f"⚠️ Informational screening only. "
             f"Not a buy signal or safety guarantee."
         )
 
