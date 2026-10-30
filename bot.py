@@ -67,10 +67,12 @@ def rugcheck(address):
         report = {}
 
     token = report.get("token") or {}
+
     if not isinstance(token, dict):
         token = {}
 
     risks = data.get("risks") or []
+
     if not isinstance(risks, list):
         risks = []
 
@@ -80,13 +82,15 @@ def rugcheck(address):
     def authority_status(field):
         if field not in token:
             return "UNKNOWN"
+
         return "REVOKED" if token[field] is None else "ACTIVE"
 
     mint_authority = authority_status("mintAuthority")
     freeze_authority = authority_status("freezeAuthority")
 
     serious = any(
-        str(item.get("level", "")).lower() in ("danger", "critical")
+        str(item.get("level", "")).lower()
+        in ("danger", "critical")
         for item in risks
         if isinstance(item, dict)
     )
@@ -110,8 +114,67 @@ def rugcheck(address):
     }
 
 
+def build_security_warnings(security):
+    warnings = []
+
+    if security["status"] == "HIGH RISK FLAGS":
+        warnings.append(
+            "RugCheck reported DANGER or CRITICAL risk flags."
+        )
+    elif security["status"] == "RISK FLAGS FOUND":
+        warnings.append(
+            "RugCheck reported one or more risk flags."
+        )
+    elif security["status"] == "UNVERIFIED":
+        warnings.append(
+            "RugCheck data could not be verified."
+        )
+
+    if security["mint_authority"] == "ACTIVE":
+        warnings.append(
+            "Mint authority is ACTIVE: more tokens may be created."
+        )
+    elif security["mint_authority"] == "UNKNOWN":
+        warnings.append(
+            "Mint authority could not be verified."
+        )
+
+    if security["freeze_authority"] == "ACTIVE":
+        warnings.append(
+            "Freeze authority is ACTIVE: token accounts may be frozen."
+        )
+    elif security["freeze_authority"] == "UNKNOWN":
+        warnings.append(
+            "Freeze authority could not be verified."
+        )
+
+    lp = security["lp"]
+
+    if lp is None:
+        warnings.append(
+            "Liquidity lock information is unavailable."
+        )
+    else:
+        try:
+            lp_value = float(lp)
+
+            if lp_value <= 0:
+                warnings.append(
+                    "Reported liquidity locked is 0%."
+                )
+
+        except (TypeError, ValueError):
+            warnings.append(
+                "Liquidity lock information could not be read."
+            )
+
+    return warnings
+
+
 def scan():
-    profiles = get_json(f"{BASE}/token-profiles/latest/v1")
+    profiles = get_json(
+        f"{BASE}/token-profiles/latest/v1"
+    )
 
     if not isinstance(profiles, list):
         return
@@ -128,7 +191,8 @@ def scan():
         return
 
     pairs = get_json(
-        f"{BASE}/tokens/v1/solana/" + ",".join(addresses)
+        f"{BASE}/tokens/v1/solana/"
+        + ",".join(addresses)
     )
 
     if not isinstance(pairs, list):
@@ -143,8 +207,13 @@ def scan():
         if not address or address not in addresses:
             continue
 
-        liquidity = (pair.get("liquidity") or {}).get("usd", 0) or 0
-        volume = (pair.get("volume") or {}).get("h1", 0) or 0
+        liquidity = (
+            pair.get("liquidity") or {}
+        ).get("usd", 0) or 0
+
+        volume = (
+            pair.get("volume") or {}
+        ).get("h1", 0) or 0
 
         txns = (pair.get("txns") or {}).get("h1", {})
         buys = txns.get("buys", 0) or 0
@@ -157,7 +226,8 @@ def scan():
             continue
 
         age = (
-            datetime.now(timezone.utc).timestamp() - created / 1000
+            datetime.now(timezone.utc).timestamp()
+            - created / 1000
         ) / 3600
 
         if age < 0 or age > MAX_AGE_HOURS:
@@ -179,7 +249,10 @@ def scan():
         score += 25 if total >= 150 else 15
         score += 25 if buy_ratio >= 0.65 else 15
 
-        if address not in best_pairs or score > best_pairs[address][0]:
+        if (
+            address not in best_pairs
+            or score > best_pairs[address][0]
+        ):
             best_pairs[address] = (score, pair)
 
     for address in addresses:
@@ -190,8 +263,13 @@ def scan():
         symbol = token.get("symbol", "UNKNOWN")
         name = token.get("name", "Unknown")
 
-        liquidity = (pair.get("liquidity") or {}).get("usd", 0) or 0
-        volume = (pair.get("volume") or {}).get("h1", 0) or 0
+        liquidity = (
+            pair.get("liquidity") or {}
+        ).get("usd", 0) or 0
+
+        volume = (
+            pair.get("volume") or {}
+        ).get("h1", 0) or 0
 
         txns = (pair.get("txns") or {}).get("h1", {})
         buys = txns.get("buys", 0) or 0
@@ -211,10 +289,15 @@ def scan():
 
         risk_text = (
             f"{risk_score}/100"
-            if risk_score is not None else "Unavailable"
+            if risk_score is not None
+            else "Unavailable"
         )
 
-        lp_text = f"{lp}%" if lp is not None else "Unknown"
+        lp_text = (
+            f"{lp}%"
+            if lp is not None
+            else "Unknown"
+        )
 
         risk_names = [
             item.get("name", "Unnamed risk")
@@ -224,7 +307,22 @@ def scan():
 
         risk_details = (
             "\n".join(f"- {item}" for item in risk_names)
-            if risk_names else "No risk details returned."
+            if risk_names
+            else "No risk details returned."
+        )
+
+        warnings = build_security_warnings(security)
+
+        warning_text = (
+            "\n".join(
+                f"⚠️ {warning}"
+                for warning in warnings
+            )
+            if warnings
+            else (
+                "No automatic warning flags detected. "
+                "This is not proof of safety."
+            )
         )
 
         message = (
@@ -244,22 +342,28 @@ def scan():
             f"Mint authority: {security['mint_authority']}\n"
             f"Freeze authority: {security['freeze_authority']}\n"
             f"Reported risks:\n{risk_details}\n\n"
+            f"--- AUTOMATIC WARNINGS ---\n"
+            f"{warning_text}\n\n"
             f"Contract:\n{address}\n\n"
             f"Chart: {pair.get('url', 'Unavailable')}\n"
-            f"Security report: https://rugcheck.xyz/tokens/{address}\n"
+            f"Security report: "
+            f"https://rugcheck.xyz/tokens/{address}\n"
             f"Axiom: https://axiom.trade/t/{address}\n"
             f"⚠️ Informational screening only. "
             f"Not a buy signal or safety guarantee."
         )
 
         if send_alert(message):
-            print(f"Alert sent: {symbol} - {score}/100")
+            print(
+                f"Alert sent: {symbol} - {score}/100"
+            )
 
 
 def main():
     if not send_alert(
         "✅ Solana Coin Radar upgraded and online!\n"
-        "Market monitoring and RugCheck screening enabled."
+        "Market monitoring, RugCheck, authority checks, "
+        "and automatic warnings enabled."
     ):
         print("Startup Telegram message failed.")
 
@@ -267,7 +371,9 @@ def main():
         try:
             scan()
         except Exception as error:
-            print(f"Scan error: {type(error).__name__}")
+            print(
+                f"Scan error: {type(error).__name__}"
+            )
 
         time.sleep(60)
 
