@@ -539,6 +539,8 @@ def scan():
 
 
 def main():
+    start_pumpportal_listener()
+
     if not send_alert(
         "✅ Solana Coin Radar upgraded and online!\n"
         "Market monitoring, RugCheck, authority checks, "
