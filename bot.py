@@ -287,9 +287,14 @@ def handle_new_token(event):
 
 async def pumpportal_listener():
     api_key = os.getenv("PUMPPORTAL_API_KEY", "").strip()
-    uri = "wss://pumpportal.fun/api/data"
-    if api_key:
-        uri += f"?api-key={api_key}"
+    if not api_key:
+        print(
+            "PumpPortal feed is waiting for PUMPPORTAL_API_KEY "
+            "to be added in Render environment variables."
+        )
+        return
+
+    uri = f"wss://pumpportal.fun/api/data?api-key={api_key}"
 
     while True:
         try:
