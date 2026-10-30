@@ -22,9 +22,7 @@ seen = set()
 
 def get_json(url):
     try:
-        response = requests.get(
-            url, headers=HEADERS, timeout=20
-        )
+        response = requests.get(url, headers=HEADERS, timeout=20)
         if response.status_code != 200:
             print(f"Data request failed: HTTP {response.status_code}")
             return None
@@ -56,26 +54,39 @@ def send_alert(message):
 
 
 def rugcheck(address):
-    url = f"{RUGCHECK}/v1/tokens/{address}/report/summary"
+    summary_url = f"{RUGCHECK}/v1/tokens/{address}/report/summary"
+    report_url = f"{RUGCHECK}/v1/tokens/{address}/report"
 
-    data = get_json(url)
+    data = get_json(summary_url)
+    report = get_json(report_url)
 
     if not isinstance(data, dict):
-        return {
-            "status": "UNVERIFIED",
-            "score": None,
-            "lp": None,
-            "risks": []
-        }
+        data = {}
+
+    if not isinstance(report, dict):
+        report = {}
+
+    token = report.get("token") or {}
+    if not isinstance(token, dict):
+        token = {}
 
     risks = data.get("risks") or []
+    if not isinstance(risks, list):
+        risks = []
 
     score = data.get("score_normalised")
     lp = data.get("lpLockedPct")
 
+    def authority_status(field):
+        if field not in token:
+            return "UNKNOWN"
+        return "REVOKED" if token[field] is None else "ACTIVE"
+
+    mint_authority = authority_status("mintAuthority")
+    freeze_authority = authority_status("freezeAuthority")
+
     serious = any(
-        str(item.get("level", "")).lower()
-        in ("danger", "critical")
+        str(item.get("level", "")).lower() in ("danger", "critical")
         for item in risks
         if isinstance(item, dict)
     )
@@ -84,21 +95,23 @@ def rugcheck(address):
         status = "HIGH RISK FLAGS"
     elif risks:
         status = "RISK FLAGS FOUND"
-    else:
+    elif data:
         status = "NO RISKS LISTED - NOT VERIFIED SAFE"
+    else:
+        status = "UNVERIFIED"
 
     return {
         "status": status,
         "score": score,
         "lp": lp,
-        "risks": risks
+        "risks": risks,
+        "mint_authority": mint_authority,
+        "freeze_authority": freeze_authority
     }
 
 
 def scan():
-    profiles = get_json(
-        f"{BASE}/token-profiles/latest/v1"
-    )
+    profiles = get_json(f"{BASE}/token-profiles/latest/v1")
 
     if not isinstance(profiles, list):
         return
@@ -115,8 +128,7 @@ def scan():
         return
 
     pairs = get_json(
-        f"{BASE}/tokens/v1/solana/"
-        + ",".join(addresses)
+        f"{BASE}/tokens/v1/solana/" + ",".join(addresses)
     )
 
     if not isinstance(pairs, list):
@@ -131,13 +143,8 @@ def scan():
         if not address or address not in addresses:
             continue
 
-        liquidity = (
-            pair.get("liquidity") or {}
-        ).get("usd", 0) or 0
-
-        volume = (
-            pair.get("volume") or {}
-        ).get("h1", 0) or 0
+        liquidity = (pair.get("liquidity") or {}).get("usd", 0) or 0
+        volume = (pair.get("volume") or {}).get("h1", 0) or 0
 
         txns = (pair.get("txns") or {}).get("h1", {})
         buys = txns.get("buys", 0) or 0
@@ -150,8 +157,7 @@ def scan():
             continue
 
         age = (
-            datetime.now(timezone.utc).timestamp()
-            - created / 1000
+            datetime.now(timezone.utc).timestamp() - created / 1000
         ) / 3600
 
         if age < 0 or age > MAX_AGE_HOURS:
@@ -184,13 +190,8 @@ def scan():
         symbol = token.get("symbol", "UNKNOWN")
         name = token.get("name", "Unknown")
 
-        liquidity = (
-            pair.get("liquidity") or {}
-        ).get("usd", 0) or 0
-
-        volume = (
-            pair.get("volume") or {}
-        ).get("h1", 0) or 0
+        liquidity = (pair.get("liquidity") or {}).get("usd", 0) or 0
+        volume = (pair.get("volume") or {}).get("h1", 0) or 0
 
         txns = (pair.get("txns") or {}).get("h1", {})
         buys = txns.get("buys", 0) or 0
@@ -213,10 +214,7 @@ def scan():
             if risk_score is not None else "Unavailable"
         )
 
-        lp_text = (
-            f"{lp}%"
-            if lp is not None else "Unknown"
-        )
+        lp_text = f"{lp}%" if lp is not None else "Unknown"
 
         risk_names = [
             item.get("name", "Unnamed risk")
@@ -243,12 +241,14 @@ def scan():
             f"RugCheck: {security['status']}\n"
             f"Normalized risk score: {risk_text}\n"
             f"Liquidity locked: {lp_text}\n"
+            f"Mint authority: {security['mint_authority']}\n"
+            f"Freeze authority: {security['freeze_authority']}\n"
             f"Reported risks:\n{risk_details}\n\n"
             f"Contract:\n{address}\n\n"
             f"Chart: {pair.get('url', 'Unavailable')}\n"
-            f"Security report: "
-            f"https://rugcheck.xyz/tokens/{address}\n"
-f"Axiom: https://axiom.trade/t/{address}\n"            f"⚠️ Informational screening only. "
+            f"Security report: https://rugcheck.xyz/tokens/{address}\n"
+            f"Axiom: https://axiom.trade/t/{address}\n"
+            f"⚠️ Informational screening only. "
             f"Not a buy signal or safety guarantee."
         )
 
