@@ -1,7 +1,11 @@
 
 import os
 import time
+import json
+import asyncio
+import threading
 import requests
+import websockets
 from datetime import datetime, timezone
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
@@ -18,6 +22,7 @@ MIN_BUY_RATIO = 0.55
 MAX_AGE_HOURS = 24
 
 seen = set()
+new_token_seen = set()
 
 
 def get_json(url):
@@ -104,13 +109,53 @@ def rugcheck(address):
     else:
         status = "UNVERIFIED"
 
+    creator = report.get("creator")
+    if isinstance(creator, dict):
+        creator = (
+            creator.get("address")
+            or creator.get("wallet")
+            or creator.get("owner")
+        )
+
+    creator_balance = report.get("creatorBalance")
+    if isinstance(creator_balance, dict):
+        creator_balance = (
+            creator_balance.get("uiAmount")
+            or creator_balance.get("balance")
+            or creator_balance.get("amount")
+        )
+
+    creator_pct = None
+    if isinstance(report.get("creatorBalance"), dict):
+        raw_pct = report["creatorBalance"].get("pct")
+        try:
+            creator_pct = float(raw_pct) if raw_pct is not None else None
+        except (TypeError, ValueError):
+            creator_pct = None
+
+    top_holders = report.get("topHolders") or []
+    top10_pct = None
+    if isinstance(top_holders, list) and top_holders:
+        try:
+            top10_pct = sum(
+                float(holder.get("pct", 0) or 0)
+                for holder in top_holders[:10]
+                if isinstance(holder, dict)
+            )
+        except (TypeError, ValueError):
+            top10_pct = None
+
     return {
         "status": status,
         "score": score,
         "lp": lp,
         "risks": risks,
         "mint_authority": mint_authority,
-        "freeze_authority": freeze_authority
+        "freeze_authority": freeze_authority,
+        "creator": creator,
+        "creator_balance": creator_balance,
+        "creator_pct": creator_pct,
+        "top10_pct": top10_pct
     }
 
 
@@ -169,6 +214,135 @@ def build_security_warnings(security):
             )
 
     return warnings
+
+
+
+def handle_new_token(event):
+    mint = event.get("mint")
+    if not mint:
+        return
+
+    name = event.get("name") or "Unknown"
+    symbol = event.get("symbol") or "UNKNOWN"
+    event_creator = event.get("traderPublicKey") or "Unavailable"
+
+    print(f"New token detected: {symbol} - {mint}")
+    security = rugcheck(mint)
+
+    creator = security.get("creator") or event_creator
+    creator_balance = security.get("creator_balance")
+    creator_balance_text = (
+        str(creator_balance) if creator_balance is not None else "Unavailable"
+    )
+    creator_pct = security.get("creator_pct")
+    creator_pct_text = (
+        f"{creator_pct:.2f}%" if creator_pct is not None else "Unavailable"
+    )
+    top10_pct = security.get("top10_pct")
+    top10_text = (
+        f"{top10_pct:.2f}%" if top10_pct is not None else "Unavailable"
+    )
+
+    warnings = build_security_warnings(security)
+    if creator_pct is not None and creator_pct >= 10:
+        warnings.append(
+            "Creator wallet is reported to hold at least 10% of the supply."
+        )
+    if top10_pct is not None and top10_pct >= 50:
+        warnings.append(
+            "Top 10 holders control at least 50% of the reported supply."
+        )
+
+    warning_text = (
+        "\\n".join(f"⚠️ {warning}" for warning in warnings)
+        if warnings
+        else "No automatic warning flags detected. This is not proof of safety."
+    )
+
+    message = (
+        f"🆕 BRAND-NEW SOLANA TOKEN DETECTED\\n\\n"
+        f"Coin: {name} ({symbol})\\n"
+        f"Mint: {mint}\\n"
+        f"Creator wallet: {creator}\\n"
+        f"Creator balance: {creator_balance_text}\\n"
+        f"Creator share: {creator_pct_text}\\n"
+        f"Top 10 holder share: {top10_text}\\n\\n"
+        f"--- EARLY SECURITY CHECK ---\\n"
+        f"RugCheck: {security['status']}\\n"
+        f"Mint authority: {security['mint_authority']}\\n"
+        f"Freeze authority: {security['freeze_authority']}\\n"
+        f"Liquidity locked: "
+        f"{security['lp']}%\\n\\n"
+        f"--- AUTOMATIC WARNINGS ---\\n"
+        f"{warning_text}\\n\\n"
+        f"Chart: https://dexscreener.com/solana/{mint}\\n"
+        f"Security report: https://rugcheck.xyz/tokens/{mint}\\n"
+        f"Axiom: https://axiom.trade/t/{mint}\\n"
+        f"⚠️ Newly created tokens are extremely risky. "
+        f"This alert is informational, not a buy signal."
+    )
+
+    send_alert(message)
+
+
+async def pumpportal_listener():
+    api_key = os.getenv("PUMPPORTAL_API_KEY", "").strip()
+    uri = "wss://pumpportal.fun/api/data"
+    if api_key:
+        uri += f"?api-key={api_key}"
+
+    while True:
+        try:
+            async with websockets.connect(
+                uri,
+                ping_interval=20,
+                ping_timeout=20,
+                close_timeout=10,
+                max_size=2**20
+            ) as websocket:
+                await websocket.send(
+                    json.dumps({"method": "subscribeNewToken"})
+                )
+                print("PumpPortal new-token stream connected.")
+
+                async for raw_message in websocket:
+                    try:
+                        event = json.loads(raw_message)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if not isinstance(event, dict):
+                        continue
+
+                    mint = event.get("mint")
+                    if not mint or mint in new_token_seen:
+                        continue
+
+                    new_token_seen.add(mint)
+                    threading.Thread(
+                        target=handle_new_token,
+                        args=(event,),
+                        daemon=True
+                    ).start()
+
+        except Exception as error:
+            print(
+                f"PumpPortal stream disconnected: {type(error).__name__}. "
+                "Reconnecting in 5 seconds."
+            )
+            await asyncio.sleep(5)
+
+
+def start_pumpportal_listener():
+    def run_listener():
+        asyncio.run(pumpportal_listener())
+
+    thread = threading.Thread(
+        target=run_listener,
+        daemon=True,
+        name="pumpportal-new-token-feed"
+    )
+    thread.start()
 
 
 def scan():
