@@ -8,7 +8,8 @@ BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
 
 BASE = "https://api.dexscreener.com"
-HEADERS = {"User-Agent": "SolanaCoinRadar/1.0"}
+RUGCHECK = "https://api.rugcheck.xyz"
+HEADERS = {"User-Agent": "SolanaCoinRadar/2.0"}
 
 MIN_LIQUIDITY = 15000
 MIN_VOLUME_1H = 10000
@@ -20,31 +21,87 @@ seen = set()
 
 
 def get_json(url):
-    response = requests.get(
-        url, headers=HEADERS, timeout=20
-    )
-    response.raise_for_status()
-    return response.json()
+    try:
+        response = requests.get(
+            url, headers=HEADERS, timeout=20
+        )
+        if response.status_code != 200:
+            print(f"Data request failed: HTTP {response.status_code}")
+            return None
+        return response.json()
+    except requests.RequestException:
+        print("Network request failed.")
+        return None
 
 
 def send_alert(message):
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    response = requests.post(
-        url,
-        json={
-            "chat_id": CHAT_ID,
-            "text": message,
-            "disable_web_page_preview": True
-        },
-        timeout=20
+    try:
+        response = requests.post(
+            url,
+            json={
+                "chat_id": CHAT_ID,
+                "text": message,
+                "disable_web_page_preview": True
+            },
+            timeout=20
+        )
+        if response.status_code != 200:
+            print(f"Telegram failed: HTTP {response.status_code}")
+            return False
+        return True
+    except requests.RequestException:
+        print("Telegram connection failed.")
+        return False
+
+
+def rugcheck(address):
+    url = f"{RUGCHECK}/v1/tokens/{address}/report/summary"
+
+    data = get_json(url)
+
+    if not isinstance(data, dict):
+        return {
+            "status": "UNVERIFIED",
+            "score": None,
+            "lp": None,
+            "risks": []
+        }
+
+    risks = data.get("risks") or []
+
+    score = data.get("score_normalised")
+    lp = data.get("lpLockedPct")
+
+    serious = any(
+        str(item.get("level", "")).lower()
+        in ("danger", "critical")
+        for item in risks
+        if isinstance(item, dict)
     )
-    response.raise_for_status()
+
+    if serious:
+        status = "HIGH RISK FLAGS"
+    elif risks:
+        status = "RISK FLAGS FOUND"
+    else:
+        status = "NO RISKS LISTED - NOT VERIFIED SAFE"
+
+    return {
+        "status": status,
+        "score": score,
+        "lp": lp,
+        "risks": risks
+    }
 
 
 def scan():
     profiles = get_json(
         f"{BASE}/token-profiles/latest/v1"
     )
+
+    if not isinstance(profiles, list):
+        return
 
     addresses = list(dict.fromkeys(
         item["tokenAddress"]
@@ -57,11 +114,13 @@ def scan():
     if not addresses:
         return
 
-    url = (
+    pairs = get_json(
         f"{BASE}/tokens/v1/solana/"
         + ",".join(addresses)
     )
-    pairs = get_json(url)
+
+    if not isinstance(pairs, list):
+        return
 
     best_pairs = {}
 
@@ -72,15 +131,22 @@ def scan():
         if not address or address not in addresses:
             continue
 
-        liquidity = (pair.get("liquidity") or {}).get("usd", 0) or 0
-        volume = (pair.get("volume") or {}).get("h1", 0) or 0
+        liquidity = (
+            pair.get("liquidity") or {}
+        ).get("usd", 0) or 0
+
+        volume = (
+            pair.get("volume") or {}
+        ).get("h1", 0) or 0
+
         txns = (pair.get("txns") or {}).get("h1", {})
         buys = txns.get("buys", 0) or 0
         sells = txns.get("sells", 0) or 0
         total = buys + sells
 
         created = pair.get("pairCreatedAt")
-        if not created:
+
+        if not created or total == 0:
             continue
 
         age = (
@@ -89,9 +155,6 @@ def scan():
         ) / 3600
 
         if age < 0 or age > MAX_AGE_HOURS:
-            continue
-
-        if total == 0:
             continue
 
         buy_ratio = buys / total
@@ -120,46 +183,92 @@ def scan():
         token = pair.get("baseToken", {})
         symbol = token.get("symbol", "UNKNOWN")
         name = token.get("name", "Unknown")
-        liquidity = (pair.get("liquidity") or {}).get("usd", 0)
-        volume = (pair.get("volume") or {}).get("h1", 0)
+
+        liquidity = (
+            pair.get("liquidity") or {}
+        ).get("usd", 0) or 0
+
+        volume = (
+            pair.get("volume") or {}
+        ).get("h1", 0) or 0
+
         txns = (pair.get("txns") or {}).get("h1", {})
-        buys = txns.get("buys", 0)
-        sells = txns.get("sells", 0)
+        buys = txns.get("buys", 0) or 0
+        sells = txns.get("sells", 0) or 0
+
         age = (
             datetime.now(timezone.utc).timestamp()
             - pair["pairCreatedAt"] / 1000
         ) / 3600
 
+        print(f"Checking security: {symbol}")
+
+        security = rugcheck(address)
+
+        risk_score = security["score"]
+        lp = security["lp"]
+
+        risk_text = (
+            f"{risk_score}/100"
+            if risk_score is not None else "Unavailable"
+        )
+
+        lp_text = (
+            f"{lp}%"
+            if lp is not None else "Unknown"
+        )
+
+        risk_names = [
+            item.get("name", "Unnamed risk")
+            for item in security["risks"][:3]
+            if isinstance(item, dict)
+        ]
+
+        risk_details = (
+            "\n".join(f"- {item}" for item in risk_names)
+            if risk_names else "No risk details returned."
+        )
+
         message = (
             f"🚨 SOLANA COIN RADAR ALERT\n\n"
             f"Coin: {name} ({symbol})\n"
-            f"Score: {score}/100\n"
+            f"Activity Score: {score}/100\n\n"
+            f"--- MARKET DATA ---\n"
             f"Liquidity: ${liquidity:,.0f}\n"
             f"1H Volume: ${volume:,.0f}\n"
             f"1H Buys: {buys}\n"
             f"1H Sells: {sells}\n"
             f"Pair age: {age:.1f} hours\n\n"
+            f"--- SECURITY CHECK ---\n"
+            f"RugCheck: {security['status']}\n"
+            f"Normalized risk score: {risk_text}\n"
+            f"Liquidity locked: {lp_text}\n"
+            f"Reported risks:\n{risk_details}\n\n"
             f"Contract:\n{address}\n\n"
             f"Chart: {pair.get('url', 'Unavailable')}\n"
+            f"Security report: "
+            f"https://rugcheck.xyz/tokens/{address}\n"
             f"Axiom: https://axiom.trade/\n\n"
-            f"⚠️ Screening alert only. Not a buy signal."
+            f"⚠️ Informational screening only. "
+            f"Not a buy signal or safety guarantee."
         )
 
-        send_alert(message)
-        print(f"Alert sent: {symbol} - {score}/100")
+        if send_alert(message):
+            print(f"Alert sent: {symbol} - {score}/100")
 
 
 def main():
-    send_alert(
-        "✅ Solana Coin Radar is online!\n"
-        "Monitoring newly surfaced Solana token profiles."
-    )
+    if not send_alert(
+        "✅ Solana Coin Radar upgraded and online!\n"
+        "Market monitoring and RugCheck screening enabled."
+    ):
+        print("Startup Telegram message failed.")
 
     while True:
         try:
             scan()
         except Exception as error:
-            print(f"Scan error: {error}")
+            print(f"Scan error: {type(error).__name__}")
 
         time.sleep(60)
 
